@@ -15,7 +15,7 @@ setup(
 
     version='0.1.1',
 
-    description='A trading robot built for Python that uses the TD Ameritrade API.',
+    description='A trading robot built for Python that uses the Charles Schwab API.',
 
     long_description=long_description,
 
@@ -24,12 +24,12 @@ setup(
     url='https://github.com/areed1192/python-trading-robot',
 
     install_requires=[
-        'td-ameritrade-python-api>=0.3.0',
-        'pandas==1.0.5',
-        'numpy==1.19.0'
+        'schwab-py>=1.0.0',
+        'pandas>=1.0.5',
+        'numpy>=1.19.0'
     ],
 
-    keywords='finance, td ameritrade, api, trading robot',
+    keywords='finance, charles schwab, api, trading robot',
 
     packages=find_namespace_packages(
         include=['pyrobot', 'samples', 'tests'],
@@ -38,7 +38,7 @@ setup(
 
     include_package_data=True,
 
-    python_requires='>=3.8',
+    python_requires='>=3.10',
 
     classifiers=[
 
@@ -62,7 +62,7 @@ setup(
         # Here I'll specify the version of Python it uses.
         'Programming Language :: Python',
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.10',
 
         # Here are the topics that my library covers.
         'Topic :: Database',

@@ -1,14 +1,22 @@
 import numpy as np
 import pandas as pd
 
+import operator #
+from typing import List #
+from typing import Optional#
+from typing import Tuple#
+
+
 from typing import Any
 from typing import Dict
 from typing import Union
 
 from pyrobot.stock_frame import StockFrame
 
-class Indicators():
 
+
+class Indicators():
+    
     """
     Represents an Indicator Object which can be used
     to easily add technical indicators to a StockFrame.
@@ -35,6 +43,7 @@ class Indicators():
             >>> indicator_client.price_data_frame
         """
 
+        # Note: anything leading with an underscore is considered private
         self._stock_frame: StockFrame = price_data_frame
         self._price_groups = price_data_frame.symbol_groups
         self._current_indicators = {}
@@ -553,8 +562,8 @@ class Indicators():
 
         # Calculate the stochastic_oscillator.
         self._frame['stochastic_oscillator'] = (
-            self._frame['close'] - self._frame['low'] / 
-            self._frame['high'] - self._frame['low']
+            (self._frame['close'] - self._frame['low']) /
+            (self._frame['high'] - self._frame['low'])
         )
 
         return self._frame 
@@ -800,12 +809,12 @@ class Indicators():
         self._frame['typical_price'] = (self._frame['high'] + self._frame['low'] + self._frame['close']) / 3
 
         # Calculate the Rolling Average of the Typical Price.
-        self._frame['typical_price_mean'] = self._frame['pp'].transform(
+        self._frame['typical_price_mean'] = self._frame['typical_price'].transform(
             lambda x: x.rolling(window=period).mean()
         )
 
         # Calculate the Rolling Standard Deviation of the Typical Price.
-        self._frame['typical_price_std'] = self._frame['pp'].transform(
+        self._frame['typical_price_std'] = self._frame['typical_price'].transform(
             lambda x: x.rolling(window=period).std()
         )
 
@@ -1029,7 +1038,7 @@ class Indicators():
 
         signals_df = self._stock_frame._check_signals(
             indicators=self._indicator_signals,
-            indciators_comp_key=self._indicators_comp_key,
+            indicators_comp_key=self._indicators_comp_key,
             indicators_key=self._indicators_key
         )
 

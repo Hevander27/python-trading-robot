@@ -1,0 +1,31 @@
+{
+  "last_updated": "2026-05-05T15:59:02.845850",
+  "last_rebalance_date": "2026-05-04T09:43:59.139816",
+  "budget": 1000.0,
+  "positions": {
+    "WOLF": {
+      "symbol": "WOLF",
+      "quantity": 2,
+      "purchase_price": 36.97,
+      "purchase_date": "2026-05-04",
+      "asset_type": "equity",
+      "ownership_status": false
+    },
+    "ASRT": {
+      "symbol": "ASRT",
+      "quantity": 2,
+      "purchase_price": 21.68,
+      "purchase_date": "2026-05-04",
+      "asset_type": "equity",
+      "ownership_status": false
+    },
+    "GBTG": {
+      "symbol": "GBTG",
+      "quantity": 6,
+      "purchase_price": 9.305,
+      "purchase_date": "2026-05-04",
+      "asset_type": "equity",
+      "ownership_status": false
+    }
+  }
+}

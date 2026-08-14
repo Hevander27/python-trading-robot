@@ -4,8 +4,6 @@ from datetime import datetime
 from typing import List
 from typing import Dict
 
-from td.client import TDClient
-
 
 class Trade():
 
@@ -38,7 +36,8 @@ class Trade():
         self._triggered_added = False
         self._multi_leg = False
         self._one_cancels_other = False
-        self._td_client: TDClient = None
+        self._schwab_client = None
+        self.account_hash = ""
     
     def to_dict(self) -> dict:
 
@@ -306,12 +305,12 @@ class Trade():
         # Add a stop Loss Order.
         if not stop_limit:
             self.add_stop_loss(
-                stop_size=profit_size,
+                stop_size=stop_size,
                 percentage=stop_percentage
             )
         else:
             self.add_stop_limit(
-                stop_size=profit_size,
+                stop_size=stop_size,
                 limit_size=limit_size,
                 stop_percentage=stop_percentage,
                 limit_percentage=limit_percentage
@@ -514,20 +513,20 @@ class Trade():
         # We need to basis to calculate off of. Use the price.
         if self.order_type == 'mkt':
 
-            quote = self._td_client.get_quotes(instruments=[self.symbol])
+            quote = self._schwab_client.get_quotes([self.symbol]).json()
 
             # Have to make a call to Get Quotes.
-            price = quote[self.symbol]['lastPrice']
+            price = quote[self.symbol]['quote']['lastPrice']
 
         elif self.order_type == 'lmt':
             price = self.price
-        
+
         else:
 
-            quote = self._td_client.get_quotes(instruments=[self.symbol])
+            quote = self._schwab_client.get_quotes([self.symbol]).json()
 
             # Have to make a call to Get Quotes.
-            price = quote[self.symbol]['lastPrice']
+            price = quote[self.symbol]['quote']['lastPrice']
         
         return round(price, 2)
 
@@ -768,8 +767,8 @@ class Trade():
             )
         else:
             # Insert it.
-            order_leg_colleciton: list = self.order['orderLegCollection']
-            order_leg_colleciton.insert(order_leg_id, leg)
+            order_leg_collection: list = self.order['orderLegCollection']
+            order_leg_collection.insert(order_leg_id, leg)
 
         return self.order['orderLegCollection']
 
@@ -880,14 +879,14 @@ class Trade():
         self.order_status = "QUEUED"
     
     def _update_order_status(self) -> None:
-        """Updates the current order status, to reflect what's on TD."""        
+        """Updates the current order status, to reflect what's on Schwab."""
 
         if self.order_id != "":
 
-            order_response = self._td_client.get_orders(
-                account=self.account,
-                order_id=self.order_id
-            )
+            order_response = self._schwab_client.get_order(
+                int(self.order_id),
+                self.account_hash
+            ).json()
 
             self.order_response = order_response
             self.order_status = self.order_response['status']
@@ -914,10 +913,10 @@ class Trade():
 
         # Loop through each child.
         for order in children:
-            
+
             # Get the latest price.
-            quote = self._td_client.get_quotes(instruments=[self.symbol])
-            last_price = quote[self.symbol]['lastPrice']
+            quote = self._schwab_client.get_quotes([self.symbol]).json()
+            last_price = quote[self.symbol]['quote']['lastPrice']
             
             # Update the price.
             if order['orderType'] == 'STOP':

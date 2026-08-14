@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 from typing import List
 from typing import Dict
@@ -22,8 +23,8 @@ class StockFrame():
 
         self._data = data
         self._frame: pd.DataFrame = self.create_frame()
-        self._symbol_groups = None
-        self._symbol_rolling_groups = None
+        self._symbol_groups: DataFrameGroupBy = None # self._symbol_groups = None
+        self._symbol_rolling_groups: RollingGroupby = None  # self._symbol_rolling_groups = None 
 
     @property
     def frame(self) -> pd.DataFrame:
@@ -73,7 +74,7 @@ class StockFrame():
 
         # If we don't a symbols group, then create it.
         if not self._symbol_groups:
-            self.symbol_groups
+            self.symbol_groups    
 
         self._symbol_rolling_groups: RollingGroupby = self._symbol_groups.rolling(
             size
@@ -113,7 +114,7 @@ class StockFrame():
             price_df['datetime'],
             unit='ms', 
             origin='unix'
-        )
+        )# unix parses epoch timestamp
 
         return price_df
 
@@ -170,6 +171,17 @@ class StockFrame():
                 origin='unix'
             )
 
+            """
+            for symbol in data:
+            
+                time_stamp = pd.to)datetime(
+                    data[symbol]['quoteTimeInLong'],
+                    unit = 'mas',
+                    origin = 'unix'
+                )
+            row_id = (symbol, time_stamp)
+            """
+
             # Define the Index Tuple.
             row_id = (quote['symbol'], time_stamp)
 
@@ -221,7 +233,7 @@ class StockFrame():
                     self._frame.columns)
             ))
 
-    def _check_signals(self, indicators: dict, indciators_comp_key: List[str], indicators_key: List[str]) -> Union[pd.DataFrame, None]:
+    def _check_signals(self, indicators: dict, indicators_comp_key: List[str], indicators_key: List[str]) -> Union[pd.DataFrame, None]:
         """Returns the last row of the StockFrame if conditions are met.
 
         Overview:
@@ -288,13 +300,13 @@ class StockFrame():
         check_indicators = []
         
         # Split the name so we can check if the indicator exist.
-        for indicator in indciators_comp_key:
+        for indicator in indicators_comp_key:
             parts = indicator.split('_comp_')
             check_indicators += parts
 
         if self.do_indicator_exist(column_names=check_indicators):
 
-            for indicator in indciators_comp_key:
+            for indicator in indicators_comp_key:
                 
                 # Split the indicators.
                 parts = indicator.split('_comp_')
