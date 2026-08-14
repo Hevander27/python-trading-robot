@@ -15,41 +15,41 @@ from pyrobot.trades import Trade
 from pyrobot.portfolio import Portfolio
 from pyrobot.stock_frame import StockFrame
 
-from td.client import TDClient
-from td.utils import TDUtilities
-
-# We are going to be doing some timestamp conversions.
-milliseconds_since_epoch = TDUtilities().milliseconds_since_epoch
+import schwab
 
 
 class PyRobot():
 
-    def __init__(self, client_id: str, redirect_uri: str, paper_trading: bool = True, credentials_path: str = None, trading_account: str = None) -> None:
-        """Initalizes a new instance of the robot and logs into the API platform specified.
+    def __init__(self, api_key: str, app_secret: str, callback_url: str, token_path: str, paper_trading: bool = True, trading_account: str = None) -> None:
+        """Initalizes a new instance of the robot and logs into the Schwab API.
 
         Arguments:
         ----
-        client_id {str} -- The Consumer ID assigned to you during the App registration.
-            This can be found at the app registration portal.
+        api_key {str} -- The App Key from your Schwab developer application.
 
-        redirect_uri {str} -- This is the redirect URL that you specified when you created your
-            TD Ameritrade Application.
+        app_secret {str} -- The App Secret from your Schwab developer application.
+
+        callback_url {str} -- The callback URL registered with your Schwab app.
+            Must use 127.0.0.1 (e.g. 'https://127.0.0.1').
+
+        token_path {str} -- The path where the OAuth token file will be stored/read.
 
         Keyword Arguments:
         ----
-        credentials_path {str} -- The path to the session state file used to prevent a full
-            OAuth workflow. (default: {None})
+        paper_trading {bool} -- If True, orders will not be executed live. (default: {True})
 
-        trading_account {str} -- Your TD Ameritrade account number. (default: {None})
+        trading_account {str} -- Your Schwab account number. (default: {None})
 
         """
 
         # Set the attirbutes
         self.trading_account = trading_account
-        self.client_id = client_id
-        self.redirect_uri = redirect_uri
-        self.credentials_path = credentials_path
-        self.session: TDClient = self._create_session()
+        self.api_key = api_key
+        self.app_secret = app_secret
+        self.callback_url = callback_url
+        self.token_path = token_path
+        self.session = self._create_session()
+        self.account_hash = self._get_account_hash()
         self.trades = {}
         self.historical_prices = {}
         self.stock_frame: StockFrame = None
@@ -58,29 +58,50 @@ class PyRobot():
         self._bar_size = None
         self._bar_type = None
 
-    def _create_session(self) -> TDClient:
+    def _create_session(self):
         """Start a new session.
 
-        Creates a new session with the TD Ameritrade API and logs the user into
-        the new session.
+        Creates a new authenticated session with the Schwab API using OAuth2.
 
         Returns:
         ----
-        TDClient -- A TDClient object with an authenticated sessions.
+        schwab.client.Client -- An authenticated Schwab client.
 
         """
 
-        # Create a new instance of the client
-        td_client = TDClient(
-            client_id=self.client_id,
-            redirect_uri=self.redirect_uri,
-            credentials_path=self.credentials_path
+        return schwab.auth.easy_client(
+            api_key=self.api_key,
+            app_secret=self.app_secret,
+            callback_url=self.callback_url,
+            token_path=self.token_path,
+            enforce_enums=False
         )
 
-        # log the client into the new session
-        td_client.login()
+    def _get_account_hash(self) -> str:
+        """Retrieves the account hash for the configured account number.
 
-        return td_client
+        Schwab API requires a hashed account identifier for trading endpoints.
+
+        Returns:
+        ----
+        str -- The account hash value.
+        """
+
+        account_numbers = self.session.get_account_numbers().json()
+
+        if not isinstance(account_numbers, list):
+            raise ValueError(
+                f"Schwab returned an unexpected response for get_account_numbers(). "
+                f"Expected a list of accounts but got: {account_numbers}. "
+                f"This usually means your token expired — delete token.json and re-run to re-authenticate."
+            )
+
+        for account in account_numbers:
+            if not isinstance(account, dict):
+                continue
+            if self.trading_account is None or account.get('accountNumber') == self.trading_account:
+                return account['hashValue']
+        raise ValueError(f"Could not find account hash for account: {self.trading_account}")
 
     @property
     def pre_market_open(self) -> bool:
@@ -106,19 +127,19 @@ class PyRobot():
 
         """
 
-        pre_market_start_time = datetime.utcnow().replace(
+        pre_market_start_time = datetime.now(timezone.utc).replace(
             hour=8,
-            minute=00,
-            second=00
+            minute=0,
+            second=0
         ).timestamp()
 
-        market_start_time = datetime.utcnow().replace(
+        market_start_time = datetime.now(timezone.utc).replace(
             hour=13,
             minute=30,
-            second=00
+            second=0
         ).timestamp()
 
-        right_now = datetime.utcnow().timestamp()
+        right_now = datetime.now(timezone.utc).timestamp()
 
         if market_start_time >= right_now >= pre_market_start_time:
             return True
@@ -149,19 +170,19 @@ class PyRobot():
 
         """
 
-        post_market_end_time = datetime.utcnow().replace(
+        post_market_end_time = datetime.now(timezone.utc).replace(
             hour=00,
             minute=00,
             second=00
         ).timestamp()
 
-        market_end_time = datetime.utcnow().replace(
+        market_end_time = datetime.now(timezone.utc).replace(
             hour=20,
             minute=00,
             second=00
         ).timestamp()
 
-        right_now = datetime.utcnow().timestamp()
+        right_now = datetime.now(timezone.utc).timestamp()
 
         if post_market_end_time >= right_now >= market_end_time:
             return True
@@ -192,25 +213,26 @@ class PyRobot():
 
         """
 
-        market_start_time = datetime.utcnow().replace(
+        market_start_time = datetime.now(timezone.utc).replace(
             hour=13,
             minute=30,
             second=00
         ).timestamp()
 
-        market_end_time = datetime.utcnow().replace(
+        market_end_time = datetime.now(timezone.utc).replace(
             hour=20,
             minute=00,
             second=00
         ).timestamp()
 
-        right_now = datetime.utcnow().timestamp()
+        right_now = datetime.now(timezone.utc).timestamp()
 
         if market_end_time >= right_now >= market_start_time:
             return True
         else:
             return False
 
+    # ALL THE FOLLOWING FUNCTION RETURN OBJECTS
     def create_portfolio(self) -> Portfolio:
         """Create a new portfolio.
 
@@ -236,8 +258,9 @@ class PyRobot():
         # Initalize the portfolio.
         self.portfolio = Portfolio(account_number=self.trading_account)
 
-        # Assign the Client
-        self.portfolio.td_client = self.session
+        # Assign the Client and account hash
+        self.portfolio.schwab_client = self.session
+        self.portfolio.account_hash = self.account_hash
 
         return self.portfolio
 
@@ -332,7 +355,8 @@ class PyRobot():
 
         # Set the Client.
         trade.account = self.trading_account
-        trade._td_client = self.session
+        trade.account_hash = self.account_hash
+        trade._schwab_client = self.session
 
         self.trades[trade_id] = trade
 
@@ -439,7 +463,7 @@ class PyRobot():
         symbols = self.portfolio.positions.keys()
 
         # Grab the quotes.
-        quotes = self.session.get_quotes(instruments=list(symbols))
+        quotes = self.session.get_quotes(list(symbols)).json()
 
         return quotes
 
@@ -491,9 +515,6 @@ class PyRobot():
         self._bar_size = bar_size
         self._bar_type = bar_type
 
-        start = str(milliseconds_since_epoch(dt_object=start))
-        end = str(milliseconds_since_epoch(dt_object=end))
-
         new_prices = []
 
         if not symbols:
@@ -504,12 +525,12 @@ class PyRobot():
             historical_prices_response = self.session.get_price_history(
                 symbol=symbol,
                 period_type='day',
-                start_date=start,
-                end_date=end,
+                start_datetime=start,
+                end_datetime=end,
                 frequency_type=bar_type,
                 frequency=bar_size,
-                extended_hours=True
-            )
+                need_extended_hours_data=True
+            ).json()
 
             self.historical_prices[symbol] = {}
             self.historical_prices[symbol]['candles'] = historical_prices_response['candles']
@@ -555,8 +576,6 @@ class PyRobot():
         # Define the start and end date.
         end_date = datetime.today()
         start_date = end_date - timedelta(days=1)
-        start = str(milliseconds_since_epoch(dt_object=start_date))
-        end = str(milliseconds_since_epoch(dt_object=end_date))
 
         latest_prices = []
 
@@ -569,12 +588,12 @@ class PyRobot():
                 historical_prices_response = self.session.get_price_history(
                     symbol=symbol,
                     period_type='day',
-                    start_date=start,
-                    end_date=end,
+                    start_datetime=start_date,
+                    end_datetime=end_date,
                     frequency_type=bar_type,
                     frequency=bar_size,
-                    extended_hours=True
-                )
+                    need_extended_hours_data=True
+                ).json()
 
             except:
 
@@ -584,12 +603,12 @@ class PyRobot():
                 historical_prices_response = self.session.get_price_history(
                     symbol=symbol,
                     period_type='day',
-                    start_date=start,
-                    end_date=end,
+                    start_datetime=start_date,
+                    end_datetime=end_date,
                     frequency_type=bar_type,
                     frequency=bar_size,
-                    extended_hours=True
-                )
+                    need_extended_hours_data=True
+                ).json()
 
             # parse the candles.
             for candle in historical_prices_response['candles'][-1:]:
@@ -644,6 +663,7 @@ class PyRobot():
 
         time_true.sleep(time_to_wait_now)
 
+    # STOCK FRAME TO CREATE INDICATORS
     def create_stock_frame(self, data: List[dict]) -> StockFrame:
         """Generates a new StockFrame Object.
 
@@ -816,10 +836,17 @@ class PyRobot():
         """
 
         # Execute the order.
-        order_dict = self.session.place_order(
-            account=self.trading_account,
-            order=trade_obj.order
+        response = self.session.place_order(
+            self.account_hash,
+            trade_obj.order
         )
+
+        # Extract the order ID from the response Location header.
+        order_id = response.headers.get('location', '').split('/')[-1]
+        order_dict = {
+            'order_id': order_id,
+            'request_body': trade_obj.order
+        }
 
         # Store the order.
         trade_obj._order_response = order_dict
@@ -922,17 +949,10 @@ class PyRobot():
 
         # Depending on how the client was initalized, either use the state account
         # or the one passed through the function.
-        if all_accounts:
-            account = 'all'
-        elif self.trading_account:
-            account = self.trading_account
+        if all_accounts or account_number is None:
+            accounts = self.session.get_accounts().json()
         else:
-            account = account_number
-
-        # Grab the accounts.
-        accounts = self.session.get_accounts(
-            account=account
-        )
+            accounts = self.session.get_account(self.account_hash).json()
 
         # Parse the account info.
         accounts_parsed = self._parse_account_balances(
@@ -963,7 +983,7 @@ class PyRobot():
 
                 account_info = accounts_response[account_type_key]
 
-                account_id = account_info['accountId']
+                account_id = account_info['accountNumber']
                 account_type = account_info['type']
                 account_current_balances = account_info['currentBalances']
                 # account_inital_balances = account_info['initialBalances']
@@ -1017,7 +1037,7 @@ class PyRobot():
 
                     account_info = account[account_type_key]
 
-                    account_id = account_info['accountId']
+                    account_id = account_info['accountNumber']
                     account_type = account_info['type']
                     account_current_balances = account_info['currentBalances']
                     # account_inital_balances = account_info['initialBalances']
@@ -1127,18 +1147,16 @@ class PyRobot():
             ]
         """
 
-        if all_accounts:
-            account = 'all'
-        elif self.trading_account and account_number is None:
-            account = self.trading_account
-        else:
-            account = account_number
-
         # Grab the positions.
-        positions = self.session.get_accounts(
-            account=account,
-            fields=['positions']
-        )
+        if all_accounts:
+            positions = self.session.get_accounts(
+                fields=[schwab.client.Client.Account.Fields.POSITIONS]
+            ).json()
+        else:
+            positions = self.session.get_account(
+                self.account_hash,
+                fields=[schwab.client.Client.Account.Fields.POSITIONS]
+            ).json()
 
         # Parse the positions.
         positions_parsed = self._parse_account_positions(
@@ -1167,7 +1185,7 @@ class PyRobot():
 
                 account_info = positions_response[account_type_key]
 
-                account_id = account_info['accountId']
+                account_id = account_info['accountNumber']
                 positions = account_info['positions']
 
                 for position in positions:
@@ -1205,7 +1223,7 @@ class PyRobot():
 
                     account_info = account[account_type_key]
 
-                    account_id = account_info['accountId']
+                    account_id = account_info['accountNumber']
                     positions = account_info['positions']
 
                     for position in positions:

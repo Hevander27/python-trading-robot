@@ -1,3 +1,10 @@
+"""
+Mimics portfolia which is made up of a postions
+postition represent types of financial instruments that we have info about
+i.e Purchase Price, Date, ticker
+Helps to execute strategies, when to enter or exit, do we own this postion
+"""
+
 import numpy as np
 
 from pandas import DataFrame
@@ -7,7 +14,6 @@ from typing import Optional
 
 
 from pyrobot.stock_frame import StockFrame
-from td.client import TDClient
 
 
 class Portfolio():
@@ -30,7 +36,8 @@ class Portfolio():
 
         self._historical_prices = []
 
-        self._td_client: TDClient = None
+        self._schwab_client = None
+        self.account_hash = None
         self._stock_frame: StockFrame = None
         self._stock_frame_daily: StockFrame = None
 
@@ -208,12 +215,79 @@ class Portfolio():
             'fixed_income': [],
             'options': [],
             'futures': [],
-            'furex': []
+            'forex': []
         }
 
         if len(self.positions.keys()) > 0:
             for symbol in self.positions:
                 total_allocation[self.positions[symbol]['asset_type']].append(self.positions[symbol])
+
+        return total_allocation
+
+    def get_unrealized_pnl(self, current_prices: dict) -> dict:
+        """Calculates unrealized P&L for all current positions.
+
+        Arguments:
+        ----
+        current_prices {dict} -- {symbol: current_price} — typically from
+            grab_current_quotes() in the main loop.
+
+        Returns:
+        ----
+        dict -- Per-symbol P&L plus a '_total' summary key:
+            {
+                'AAPL': {
+                    'quantity': 10,
+                    'purchase_price': 150.00,
+                    'current_price': 160.00,
+                    'cost_basis': 1500.00,
+                    'market_value': 1600.00,
+                    'unrealized_pnl': 100.00,
+                    'pct_change': 6.67
+                },
+                '_total': {
+                    'total_cost': 1500.00,
+                    'total_value': 1600.00,
+                    'total_unrealized_pnl': 100.00,
+                    'total_pct_change': 6.67
+                }
+            }
+        """
+        pnl = {}
+        total_cost = 0.0
+        total_value = 0.0
+
+        for symbol, position in self.positions.items():
+            purchase_price = float(position.get('purchase_price', 0))
+            quantity = int(position.get('quantity', 0))
+            current_price = current_prices.get(symbol, purchase_price)
+
+            cost_basis = purchase_price * quantity
+            market_value = current_price * quantity
+            unrealized = market_value - cost_basis
+            pct_change = (unrealized / cost_basis * 100) if cost_basis > 0 else 0.0
+
+            pnl[symbol] = {
+                'quantity': quantity,
+                'purchase_price': purchase_price,
+                'current_price': current_price,
+                'cost_basis': cost_basis,
+                'market_value': market_value,
+                'unrealized_pnl': unrealized,
+                'pct_change': pct_change
+            }
+
+            total_cost += cost_basis
+            total_value += market_value
+
+        pnl['_total'] = {
+            'total_cost': total_cost,
+            'total_value': total_value,
+            'total_unrealized_pnl': total_value - total_cost,
+            'total_pct_change': ((total_value - total_cost) / total_cost * 100) if total_cost > 0 else 0.0
+        }
+
+        return pnl
 
     def portfolio_variance(self, weights: dict, covariance_matrix: DataFrame) -> dict:
 
@@ -254,7 +328,7 @@ class Portfolio():
             self._grab_daily_historical_prices()
 
         # Calculate the weights.
-        porftolio_weights = self.portfolio_weights()
+        portfolio_weights = self.portfolio_weights()
 
         # Calculate the Daily Returns (%)
         self._stock_frame_daily.frame['daily_returns_pct'] = self._stock_frame_daily.symbol_groups['close'].transform(
@@ -287,7 +361,7 @@ class Portfolio():
         metrics_dict = {}
 
         portfolio_variance = self.portfolio_variance(
-            weights=porftolio_weights,
+            weights=portfolio_weights,
             covariance_matrix=returns_cov
         )
 
@@ -295,7 +369,7 @@ class Portfolio():
 
             symbol = index_tuple[0]
             metrics_dict[symbol] = {}
-            metrics_dict[symbol]['weight'] = porftolio_weights[symbol]
+            metrics_dict[symbol]['weight'] = portfolio_weights[symbol]
             metrics_dict[symbol]['average_returns'] = returns_avg[index_tuple]
             metrics_dict[symbol]['weighted_returns'] = returns_avg[index_tuple] * \
                 metrics_dict[symbol]['weight']
@@ -323,7 +397,7 @@ class Portfolio():
         symbols = self.positions.keys()
 
         # Grab the quotes.
-        quotes = self.td_client.get_quotes(instruments=list(symbols))
+        quotes = self.schwab_client.get_quotes(list(symbols)).json()
 
         # Grab the projected market value.
         projected_market_value_dict = self.projected_market_value(
@@ -347,7 +421,7 @@ class Portfolio():
         symbols = self.positions.keys()
 
         # Grab the quotes.
-        quotes = self.td_client.get_quotes(instruments=list(symbols))
+        quotes = self.schwab_client.get_quotes(list(symbols)).json()
 
         portfolio_summary_dict = {}
         portfolio_summary_dict['projected_market_value'] = self.projected_market_value(
@@ -512,12 +586,12 @@ class Portfolio():
                 projected_value[symbol] = {}
                 current_quantity = self.positions[symbol]['quantity']
                 purchase_price = self.positions[symbol]['purchase_price']
-                current_price = current_prices[symbol]['lastPrice']
+                current_price = current_prices[symbol]['quote']['lastPrice']
                 is_profitable = self.is_profitable(
                     symbol=symbol, current_price=current_price)
 
                 projected_value[symbol]['purchase_price'] = purchase_price
-                projected_value[symbol]['current_price'] = current_prices[symbol]['lastPrice']
+                projected_value[symbol]['current_price'] = current_prices[symbol]['quote']['lastPrice']
                 projected_value[symbol]['quantity'] = current_quantity
                 projected_value[symbol]['is_profitable'] = is_profitable
 
@@ -601,26 +675,26 @@ class Portfolio():
         self._stock_frame = stock_frame
 
     @property
-    def td_client(self) -> TDClient:
-        """Gets the TDClient object for the Portfolio
+    def schwab_client(self):
+        """Gets the Schwab client object for the Portfolio
 
         Returns:
         ----
-        {TDClient} -- An authenticated session with the TD API.
+        An authenticated Schwab client session.
         """
 
-        return self._td_client
+        return self._schwab_client
 
-    @td_client.setter
-    def td_client(self, td_client: TDClient) -> None:
-        """Sets the TDClient object for the Portfolio
+    @schwab_client.setter
+    def schwab_client(self, schwab_client) -> None:
+        """Sets the Schwab client object for the Portfolio
 
         Arguments:
         ----
-        td_client {TDClient} -- An authenticated session with the TD API.
+        schwab_client -- An authenticated Schwab client session.
         """
 
-        self._td_client: TDClient = td_client
+        self._schwab_client = schwab_client
 
     def _grab_daily_historical_prices(self) -> StockFrame:
         """Grabs the daily historical prices for each position.
@@ -636,14 +710,14 @@ class Portfolio():
         for symbol in self.positions:
 
             # Grab the historical prices.
-            historical_prices_response = self.td_client.get_price_history(
+            historical_prices_response = self.schwab_client.get_price_history(
                 symbol=symbol,
                 period_type='year',
                 period=1,
                 frequency_type='daily',
                 frequency=1,
-                extended_hours=True
-            )
+                need_extended_hours_data=True
+            ).json()
 
             # Loop through the chandles.
             for candle in historical_prices_response['candles']:
