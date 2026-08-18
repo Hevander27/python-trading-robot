@@ -132,3 +132,13 @@ pyrobot/config.py
 tests/config.py
 .vscode/settings.json
 indicators/
+
+# Local secrets & runtime state — never commit
+config/config.ini
+token.json
+data/orders.json
+data/portfolio_state.json
+data/portfolio_state*.json
+data/archive/
+logs/
+check_accounts.py

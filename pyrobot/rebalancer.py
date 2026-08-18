@@ -16,6 +16,7 @@ from typing import Dict, List
 
 from pyrobot.scorer import MomentumScorer
 from pyrobot.position_sizer import PositionSizer
+from pyrobot.robot import OrderRejectedError
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +256,11 @@ class Rebalancer:
         for sell_symbol in replacements.keys():
             quantity = holdings.get(sell_symbol, {}).get('quantity', 0)
             if quantity > 0:
-                response = self._execute_sell(sell_symbol, quantity)
+                try:
+                    response = self._execute_sell(sell_symbol, quantity)
+                except OrderRejectedError as exc:
+                    logger.error(f"Rebalancer: SELL {sell_symbol} rejected — keeping position. {exc}")
+                    continue
                 order_responses.append(response)
                 self.robot.portfolio.remove_position(symbol=sell_symbol)
                 self._print_order(response)
@@ -269,11 +274,15 @@ class Rebalancer:
 
         # Execute buys
         for buy_symbol, allocation in buy_allocations.items():
-            response = self._execute_buy(
-                symbol=buy_symbol,
-                shares=allocation['shares'],
-                price=allocation['price']
-            )
+            try:
+                response = self._execute_buy(
+                    symbol=buy_symbol,
+                    shares=allocation['shares'],
+                    price=allocation['price']
+                )
+            except OrderRejectedError as exc:
+                logger.error(f"Rebalancer: BUY {buy_symbol} rejected — not recording position. {exc}")
+                continue
             order_responses.append(response)
             self.robot.portfolio.add_position(
                 symbol=buy_symbol,
