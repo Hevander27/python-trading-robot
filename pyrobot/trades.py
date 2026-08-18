@@ -5,6 +5,20 @@ from typing import List
 from typing import Dict
 
 
+def round_price(price: float) -> float:
+    """Rounds a price to the precision Schwab accepts.
+
+    Schwab rejects orders with more than 2 decimals for prices >= $1
+    and more than 4 decimals for prices < $1.
+    """
+    if price is None:
+        return price
+    price = float(price)
+    if price < 1:
+        return round(price, 4)
+    return round(price, 2)
+
+
 class Trade():
 
     """
@@ -96,6 +110,10 @@ class Trade():
                 'short': 'BUY_TO_COVER'
             }
         }
+
+        # Normalise prices to Schwab's accepted precision.
+        price = round_price(price)
+        stop_limit_price = round_price(stop_limit_price)
 
         self.order = {
             "orderStrategyType": "SINGLE",
@@ -799,6 +817,8 @@ class Trade():
                 'stop-limit-limit-price'
             ]
         """
+
+        new_price = round_price(new_price)
 
         if price_type == 'price':
             self.order['price'] = new_price

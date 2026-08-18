@@ -32,7 +32,7 @@ import pathlib
 from datetime import datetime, timedelta
 from configparser import ConfigParser
 
-from pyrobot.robot import PyRobot
+from pyrobot.robot import PyRobot, OrderRejectedError
 from pyrobot.indicators import Indicators
 from pyrobot.scanner import NasdaqScanner
 from pyrobot.scorer import MomentumScorer
@@ -187,6 +187,131 @@ def load_state() -> dict:
         return {}
 
 
+def get_broker_positions(robot) -> dict:
+    """Returns {symbol: quantity} for the equity positions Schwab actually reports."""
+    positions = robot.get_positions(account_number=robot.trading_account)
+    result = {}
+    for pos in positions or []:
+        symbol = pos.get('symbol')
+        qty = float(pos.get('long_quantity') or 0) - float(pos.get('short_quantity') or 0)
+        if symbol and qty:
+            result[symbol] = qty
+    return result
+
+
+def reconcile_with_broker(robot, portfolio) -> None:
+    """Compares the bot's state file with the real Schwab account.
+
+    In LIVE mode any position the bot thinks it holds but Schwab does not
+    (or holds in a different quantity) is a hard error — the bot would
+    otherwise send sells for shares it doesn't own, or size everything off a
+    fiction. Positions Schwab holds that the bot doesn't track (e.g. manual
+    buys) are only reported; the bot deliberately ignores them.
+    """
+    try:
+        broker = get_broker_positions(robot)
+    except Exception as exc:
+        msg = f"Could not fetch positions from Schwab for reconciliation: {exc}"
+        if robot.paper_trading:
+            logger.warning(msg)
+            return
+        raise RuntimeError(msg) from exc
+
+    tracked = portfolio.positions
+    mismatches = []
+    for symbol, pos in tracked.items():
+        want = float(pos.get('quantity', 0))
+        have = broker.get(symbol, 0.0)
+        if have != want:
+            mismatches.append(f"{symbol}: bot thinks {want:g}, Schwab has {have:g}")
+
+    untracked = sorted(set(broker) - set(tracked))
+    if untracked:
+        logger.info(f"Reconcile: account holds positions the bot does not manage (ignored): {untracked}")
+
+    if not mismatches:
+        logger.info(f"Reconcile: OK — {len(tracked)} tracked position(s) match Schwab.")
+        return
+
+    for m in mismatches:
+        logger.error(f"Reconcile MISMATCH — {m}")
+
+    if robot.paper_trading:
+        logger.warning("Reconcile: mismatches ignored because paper_trading=True.")
+        return
+
+    raise SystemExit(
+        "\nRefusing to start in LIVE mode: the bot's saved state does not match your Schwab account.\n"
+        f"Fix or delete {STATE_PATH} and restart.\n"
+    )
+
+
+def place_initial_buy(robot, portfolio, symbol: str, allocation: dict, stop_loss: float) -> bool:
+    """Builds and sends one initial LIMIT buy with a bracketed stop loss.
+
+    Only records the position if the broker accepted the order.
+    Returns True if the position was recorded.
+    """
+    buy_trade = robot.create_trade(
+        trade_id=f'buy_{symbol}_init',
+        enter_or_exit='enter',
+        long_or_short='long',
+        order_type='lmt',
+        price=allocation['price']
+    )
+    buy_trade.instrument(symbol=symbol, quantity=allocation['shares'], asset_type='EQUITY')
+    buy_trade.modify_session(session='normal')
+    buy_trade.add_stop_loss(stop_size=stop_loss, percentage=True)
+
+    if not robot.paper_trading:
+        try:
+            robot.execute_orders(trade_obj=buy_trade)
+        except OrderRejectedError as exc:
+            logger.error(f"Initial BUY {symbol} rejected — not recording position. {exc}")
+            return False
+
+    portfolio.add_position(
+        symbol=symbol,
+        asset_type='equity',
+        quantity=allocation['shares'],
+        purchase_price=allocation['price'],
+        purchase_date=datetime.now().strftime('%Y-%m-%d')
+    )
+    logger.info(
+        f"\033[92m  BUY {symbol}: {allocation['shares']} shares "
+        f"@ ${allocation['price']:.2f} = ${allocation['total_cost']:.2f}\033[0m"
+    )
+    return True
+
+
+def build_exit_trade(robot, portfolio, symbol: str) -> dict:
+    """Creates the intraday RSI *exit* for a held position.
+
+    The loop's RSI signal is used only to sell holdings that become overbought
+    (RSI >= 70). We deliberately do NOT wire a 'buy' side: we already own the
+    stock, and re-buying on every oversold tick is how the bot previously
+    tried to send hundreds of duplicate BUY orders.
+
+    Returns the trades_dict entry for `symbol`.
+    """
+    quantity = int(portfolio.positions.get(symbol, {}).get('quantity', 0))
+    trade_id = f'exit_{symbol}'
+    exit_trade = robot.create_trade(
+        trade_id=trade_id,
+        enter_or_exit='exit',
+        long_or_short='long',
+        order_type='mkt'
+    )
+    exit_trade.instrument(symbol=symbol, quantity=quantity, asset_type='EQUITY')
+    exit_trade.modify_session(session='normal')
+    return {
+        'sell': {
+            'trade_func': robot.trades[trade_id],
+            'trade_id': trade_id
+        }
+    }
+
+
 # ── Initialise PyRobot ─────────────────────────────────────────────────────────
 
 print("=" * 60)
@@ -205,7 +330,7 @@ trading_robot = PyRobot(
     callback_url=CALLBACK_URL,
     token_path=TOKEN_PATH,
     trading_account=ACCOUNT_NUMBER,
-    paper_trading=True
+    paper_trading=False  # Set False for LIVE trading. Before doing so: delete a stale data/portfolio_state.json.
 )
 
 trading_robot_portfolio = trading_robot.create_portfolio()
@@ -269,6 +394,9 @@ if saved_state.get('positions'):
     print(f"Restored {len(saved_state['positions'])} positions.")
     pprint.pprint(trading_robot_portfolio.positions)
 
+    # Never trust the state file blindly — check it against the real account.
+    reconcile_with_broker(trading_robot, trading_robot_portfolio)
+
 else:
     # Fresh start — scan, score, and buy initial positions
     logger.info("No saved state found. Running fresh startup scan...")
@@ -310,39 +438,16 @@ else:
     allocations = position_sizer.get_allocations(top_picks, BUDGET, scores=top_scores)
 
     logger.info("Startup: Buying initial positions...")
+    bought = 0
     for symbol, allocation in allocations.items():
-        buy_trade = trading_robot.create_trade(
-            trade_id=f'buy_{symbol}_init',
-            enter_or_exit='enter',
-            long_or_short='long',
-            order_type='lmt',
-            price=allocation['price']
-        )
-        buy_trade.instrument(symbol=symbol, quantity=allocation['shares'], asset_type='EQUITY')
-        buy_trade.modify_session(session='normal')
-        buy_trade.add_stop_loss(stop_size=active_stop_loss, percentage=True)
-
-        if not trading_robot.paper_trading:
-            trading_robot.execute_orders(trade_obj=buy_trade)
-
-        trading_robot_portfolio.add_position(
-            symbol=symbol,
-            asset_type='equity',
-            quantity=allocation['shares'],
-            purchase_price=allocation['price'],
-            purchase_date=datetime.now().strftime('%Y-%m-%d')
-        )
-
-        logger.info(
-            f"\033[92m  BUY {symbol}: {allocation['shares']} shares "
-            f"@ ${allocation['price']:.2f} = ${allocation['total_cost']:.2f}\033[0m"
-        )
+        if place_initial_buy(trading_robot, trading_robot_portfolio, symbol, allocation, active_stop_loss):
+            bought += 1
 
     last_rebalance_date = datetime.now()
-    logger.info(f"Portfolio initialised with {len(allocations)} positions.")
+    logger.info(f"Portfolio initialised with {bought} of {len(allocations)} planned positions.")
     pprint.pprint(trading_robot_portfolio.positions)
 
-        # Save state immediately after initial buys
+    # Save state immediately after initial buys
     save_state(trading_robot_portfolio, last_rebalance_date)
 
 
@@ -381,31 +486,7 @@ if active_symbols:
     )
 
     for symbol in active_symbols:
-        position = trading_robot_portfolio.positions.get(symbol, {})
-        current_price = position.get('purchase_price', 0)
-        quantity = position.get('quantity', 1)
-
-        intraday_trade = trading_robot.create_trade(
-            trade_id=f'intraday_{symbol}',
-            enter_or_exit='enter',
-            long_or_short='long',
-            order_type='lmt',
-            price=current_price
-        )
-        intraday_trade.instrument(symbol=symbol, quantity=quantity, asset_type='EQUITY')
-        intraday_trade.modify_session(session='normal')
-        intraday_trade.add_stop_loss(stop_size=STOP_LOSS_PCT, percentage=True)
-
-        trades_dict[symbol] = {
-            'buy': {
-                'trade_func': trading_robot.trades[f'intraday_{symbol}'],
-                'trade_id': f'intraday_{symbol}'
-            },
-            'sell': {
-                'trade_func': trading_robot.trades[f'intraday_{symbol}'],
-                'trade_id': f'intraday_{symbol}'
-            }
-        }
+        trades_dict[symbol] = build_exit_trade(trading_robot, trading_robot_portfolio, symbol)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -434,15 +515,17 @@ while True:
             print(stock_frame.symbol_groups.tail())
             print("-" * 60)
 
-    # Update each trade's limit price to the current market price
+    # Update any LIMIT trade's price to the current market price.
+    # (trades are keyed by trade_id, not symbol — look the symbol up on the trade)
     current_quotes = trading_robot.grab_current_quotes()
-    for symbol in list(trading_robot.trades.keys()):
-        if symbol in current_quotes and 'quote' in current_quotes[symbol]:
-            live_price = current_quotes[symbol]['quote']['lastPrice']
-            trading_robot.trades[symbol].modify_price(
-                new_price=live_price,
-                price_type='limit-price'
-            )
+    for trade in list(trading_robot.trades.values()):
+        if not getattr(trade, 'is_limit_order', False):
+            continue
+        sym = getattr(trade, 'symbol', None)
+        quote = current_quotes.get(sym, {}).get('quote', {}) if sym else {}
+        live_price = quote.get('lastPrice')
+        if live_price:
+            trade.modify_price(new_price=live_price, price_type='limit-price')
 
     # ── Software stop loss (paper trading fallback) ────────────────────────────
     # Schwab doesn't fill stop orders in paper mode, so we monitor manually.
@@ -470,7 +553,13 @@ while True:
                     stop_trade.modify_session(session='normal')
 
                     if not trading_robot.paper_trading:
-                        trading_robot.execute_orders(trade_obj=stop_trade)
+                        try:
+                            trading_robot.execute_orders(trade_obj=stop_trade)
+                        except OrderRejectedError as exc:
+                            # Keep the position so we retry next bar; the startup
+                            # reconcile guarantees it's a real holding.
+                            logger.error(f"STOP LOSS sell for {symbol} rejected — will retry next bar. {exc}")
+                            continue
 
                     trading_robot_portfolio.remove_position(symbol=symbol)
                     trades_dict.pop(symbol, None)
@@ -552,6 +641,11 @@ while True:
                     f"\033[91m▼ SELL {symbol:<6}  {quantity} shares @ ${price:.2f}"
                     f"  [{order_type}]  {timestamp}\033[0m"
                 )
+                # RSI exit sent — drop the position from our books and stop
+                # tracking it, so neither this exit nor the stop loss fires again.
+                if symbol in trading_robot_portfolio.positions:
+                    trading_robot_portfolio.remove_position(symbol=symbol)
+                trades_dict.pop(symbol, None)
         # Save state after any intraday trade
         save_state(trading_robot_portfolio, last_rebalance_date)
 
@@ -575,46 +669,27 @@ while True:
             allocations = position_sizer.get_allocations(top_picks, BUDGET, scores=top_scores)
 
             for symbol, allocation in allocations.items():
-                buy_trade = trading_robot.create_trade(
-                    trade_id=f'buy_{symbol}_init',
-                    enter_or_exit='enter',
-                    long_or_short='long',
-                    order_type='lmt',
-                    price=allocation['price']
-                )
-                buy_trade.instrument(symbol=symbol, quantity=allocation['shares'], asset_type='EQUITY')
-                buy_trade.modify_session(session='normal')
-                buy_trade.add_stop_loss(stop_size=active_stop_loss, percentage=True)
-                if not trading_robot.paper_trading:
-                    trading_robot.execute_orders(trade_obj=buy_trade)
-                trading_robot_portfolio.add_position(
-                    symbol=symbol,
-                    asset_type='equity',
-                    quantity=allocation['shares'],
-                    purchase_price=allocation['price'],
-                    purchase_date=datetime.now().strftime('%Y-%m-%d')
-                )
-                logger.info(
-                    f"\033[92m  BUY {symbol}: {allocation['shares']} shares "
-                    f"@ ${allocation['price']:.2f} = ${allocation['total_cost']:.2f}\033[0m"
-                )
+                place_initial_buy(trading_robot, trading_robot_portfolio, symbol, allocation, active_stop_loss)
 
             # Initialise indicators now that we have positions
             active_symbols = list(trading_robot_portfolio.positions.keys())
-            start_date = datetime.today()
-            hist_start = start_date - timedelta(days=30)
-            historical_prices = trading_robot.grab_historical_prices(
-                start=hist_start, end=start_date, bar_size=1, bar_type='minute'
-            )
-            stock_frame = trading_robot.create_stock_frame(data=historical_prices['aggregated'])
-            trading_robot.portfolio.stock_frame = stock_frame
-            indicator_client = Indicators(price_data_frame=stock_frame)
-            indicator_client.rsi(period=14)
-            indicator_client.ema(period=50)
-            indicator_client.set_indicator_signal(
-                indicator='rsi', buy=30.0, sell=70.0,
-                condition_buy=operator.le, condition_sell=operator.ge
-            )
+            if active_symbols:
+                start_date = datetime.today()
+                hist_start = start_date - timedelta(days=30)
+                historical_prices = trading_robot.grab_historical_prices(
+                    start=hist_start, end=start_date, bar_size=1, bar_type='minute'
+                )
+                stock_frame = trading_robot.create_stock_frame(data=historical_prices['aggregated'])
+                trading_robot.portfolio.stock_frame = stock_frame
+                indicator_client = Indicators(price_data_frame=stock_frame)
+                indicator_client.rsi(period=14)
+                indicator_client.ema(period=50)
+                indicator_client.set_indicator_signal(
+                    indicator='rsi', buy=30.0, sell=70.0,
+                    condition_buy=operator.le, condition_sell=operator.ge
+                )
+                for symbol in active_symbols:
+                    trades_dict[symbol] = build_exit_trade(trading_robot, trading_robot_portfolio, symbol)
             last_rebalance_date = datetime.now()
             save_state(trading_robot_portfolio, last_rebalance_date)
 
@@ -639,8 +714,22 @@ while True:
             else:
                 logger.info("Rebalance complete — no changes made.")
 
+            # Keep the intraday exit trades in sync with what we now hold.
+            held = set(trading_robot_portfolio.positions.keys())
+            for sym in list(trades_dict.keys()):
+                if sym not in held:
+                    trades_dict.pop(sym, None)
+            for sym in held:
+                if sym not in trades_dict:
+                    trades_dict[sym] = build_exit_trade(trading_robot, trading_robot_portfolio, sym)
+
         last_rebalance_date = datetime.now()
         save_state(trading_robot_portfolio, last_rebalance_date)
+
+    logger.info(
+        f"Tick complete — {len(trading_robot_portfolio.positions)} position(s) tracked, "
+        f"{'LIVE' if not trading_robot.paper_trading else 'PAPER'} mode."
+    )
 
     # Wait until the next 1-minute bar (skip if no stock frame yet)
     if stock_frame is not None:

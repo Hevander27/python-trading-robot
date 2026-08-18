@@ -12,10 +12,33 @@ from typing import Dict
 from typing import Union
 
 from pyrobot.trades import Trade
+from pyrobot.trades import round_price
 from pyrobot.portfolio import Portfolio
 from pyrobot.stock_frame import StockFrame
 
 import schwab
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class OrderRejectedError(Exception):
+    """Raised when Schwab does not accept an order submission."""
+
+    def __init__(self, status_code: int, body: str, order: dict):
+        self.status_code = status_code
+        self.body = body
+        self.order = order
+        super().__init__(f"Schwab rejected order (HTTP {status_code}): {body}")
+
+
+def _sanitize_order_prices(order: dict) -> None:
+    """Recursively rounds every 'price'/'stopPrice' in an order (incl. child orders)."""
+    for key in ('price', 'stopPrice'):
+        if key in order and order[key] is not None:
+            order[key] = round_price(order[key])
+    for child in order.get('childOrderStrategies', []) or []:
+        _sanitize_order_prices(child)
 
 
 class PyRobot():
@@ -643,8 +666,16 @@ class PyRobot():
 
         time_to_wait_now = next_bar_timestamp - curr_bar_timestamp
 
-        if time_to_wait_now < 0:
-            time_to_wait_now = 0
+        # If the last bar is stale (older than one bar — e.g. thin trading, a
+        # delayed feed, or a bar from a previous session), the naive calculation
+        # gives 0 and the caller spins in a tight loop hammering the API. Fall
+        # back to waiting until the next wall-clock minute boundary instead.
+        if time_to_wait_now <= 0:
+            time_to_wait_now = 60 - (curr_bar_timestamp % 60)
+            next_bar_time = curr_bar_time + timedelta(seconds=time_to_wait_now)
+
+        # Never sleep less than a few seconds — one loop iteration per bar, period.
+        time_to_wait_now = max(time_to_wait_now, 5)
 
         print("=" * 80)
         print("Pausing for the next bar")
@@ -718,99 +749,69 @@ class PyRobot():
 
         order_responses = []
 
-        # If we have buys or sells continue.
+        def _fire(symbol: str, side: str) -> None:
+            """Sends the trade for `symbol`/`side` exactly once.
+
+            Guards:
+              - skips if no trade is configured for that side
+              - skips if this side has already been sent (idempotent across loop
+                ticks — a signal that stays true must not re-send every bar)
+              - on rejection, marks the side as attempted so we don't spam
+                Schwab with the same doomed order once per bar
+            """
+            entry = trades_to_execute.get(symbol)
+            if not entry or side not in entry or not entry[side]:
+                return
+
+            executed_key = f'{side}_executed'
+            if entry.get(executed_key):
+                return
+
+            trade_obj: Trade = entry[side]['trade_func']
+
+            if self.portfolio.in_portfolio(symbol=symbol):
+                self.portfolio.set_ownership_status(
+                    symbol=symbol,
+                    ownership=(side == 'buy')
+                )
+
+            # Mark before sending so a partial failure can't cause a re-fire.
+            entry[executed_key] = True
+            entry['has_executed'] = True
+
+            if not self.paper_trading:
+                try:
+                    order_response = self.execute_orders(trade_obj=trade_obj)
+                except OrderRejectedError as exc:
+                    logger.error(f"{side.upper()} signal for {symbol} NOT executed — {exc}")
+                    entry['last_error'] = str(exc)
+                    return
+
+                order_responses.append({
+                    'order_id': order_response['order_id'],
+                    'order_status': order_response.get('order_status'),
+                    'request_body': order_response['request_body'],
+                    'timestamp': datetime.now().isoformat(),
+                    'symbol': symbol,
+                    'side': side
+                })
+            else:
+                order_responses.append({
+                    'order_id': trade_obj._generate_order_id(),
+                    'order_status': 'PAPER',
+                    'request_body': trade_obj.order,
+                    'timestamp': datetime.now().isoformat(),
+                    'symbol': symbol,
+                    'side': side
+                })
+
         if not buys.empty:
+            for symbol in buys.index.get_level_values(0).to_list():
+                _fire(symbol, 'buy')
 
-            # Grab the buy Symbols.
-            symbols_list = buys.index.get_level_values(0).to_list()
-
-            # Loop through each symbol.
-            for symbol in symbols_list:
-
-                # Check to see if there is a Trade object.
-                if symbol in trades_to_execute:
-
-                    if self.portfolio.in_portfolio(symbol=symbol):
-                        self.portfolio.set_ownership_status(
-                            symbol=symbol,
-                            ownership=True
-                        )
-
-                    # Set the Execution Flag.
-                    trades_to_execute[symbol]['has_executed'] = True
-                    trade_obj: Trade = trades_to_execute[symbol]['buy']['trade_func']
-
-                    if not self.paper_trading:
-
-                        # Execute the order.
-                        order_response = self.execute_orders(
-                            trade_obj=trade_obj
-                        )
-
-                        order_response = {
-                            'order_id': order_response['order_id'],
-                            'request_body': order_response['request_body'],
-                            'timestamp': datetime.now().isoformat()
-                        }
-
-                        order_responses.append(order_response)
-
-                    else:
-
-                        order_response = {
-                            'order_id': trade_obj._generate_order_id(),
-                            'request_body': trade_obj.order,
-                            'timestamp': datetime.now().isoformat()
-                        }
-
-                        order_responses.append(order_response)
-
-        elif not sells.empty:
-
-            # Grab the buy Symbols.
-            symbols_list = sells.index.get_level_values(0).to_list()
-
-            # Loop through each symbol.
-            for symbol in symbols_list:
-
-                # Check to see if there is a Trade object.
-                if symbol in trades_to_execute:
-
-                    # Set the Execution Flag.
-                    trades_to_execute[symbol]['has_executed'] = True
-
-                    if self.portfolio.in_portfolio(symbol=symbol):
-                        self.portfolio.set_ownership_status(
-                            symbol=symbol,
-                            ownership=False
-                        )
-
-                    trade_obj: Trade = trades_to_execute[symbol]['sell']['trade_func']
-
-                    if not self.paper_trading:
-
-                        # Execute the order.
-                        order_response = self.execute_orders(
-                            trade_obj=trade_obj
-                        )
-
-                        order_response = {
-                            'order_id': order_response['order_id'],
-                            'request_body': order_response['request_body'],
-                            'timestamp': datetime.now().isoformat()
-                        }
-
-                        order_responses.append(order_response)
-
-                    else:
-
-                        order_response = {
-                            'order_id': trade_obj._generate_order_id(),
-                            'request_body': trade_obj.order,
-                            'timestamp': datetime.now().isoformat()
-                        }
-
-                        order_responses.append(order_response)
+        if not sells.empty:
+            for symbol in sells.index.get_level_values(0).to_list():
+                _fire(symbol, 'sell')
 
         # Save the response.
         self.save_orders(order_response_dict=order_responses)
@@ -835,16 +836,52 @@ class PyRobot():
         {dict} -- An order response dicitonary.
         """
 
+        # Final guard: make sure every price in the payload has Schwab-legal precision.
+        _sanitize_order_prices(trade_obj.order)
+
         # Execute the order.
         response = self.session.place_order(
             self.account_hash,
             trade_obj.order
         )
 
+        # Schwab answers 201 Created with the order URL in the Location header.
+        # Anything else means the order was NOT accepted — surface it loudly
+        # instead of silently recording a phantom position.
+        if not (200 <= response.status_code < 300):
+            body = response.text
+            logger.error(
+                f"ORDER REJECTED (HTTP {response.status_code}) for {trade_obj.order.get('orderLegCollection', [{}])[0].get('instrument', {}).get('symbol', '?')}: {body}"
+            )
+            raise OrderRejectedError(response.status_code, body, trade_obj.order)
+
         # Extract the order ID from the response Location header.
         order_id = response.headers.get('location', '').split('/')[-1]
+
+        # Fetch the order back so we log Schwab's actual status (WORKING/FILLED/REJECTED).
+        # Schwab can accept the POST and still reject the order on validation.
+        order_status = None
+        status_description = None
+        if order_id:
+            try:
+                status_resp = self.session.get_order(int(order_id), self.account_hash)
+                if 200 <= status_resp.status_code < 300:
+                    status_json = status_resp.json()
+                    order_status = status_json.get('status')
+                    status_description = status_json.get('statusDescription')
+            except Exception as exc:  # status lookup is best-effort
+                logger.warning(f"Could not fetch status for order {order_id}: {exc}")
+
+        symbol = trade_obj.order.get('orderLegCollection', [{}])[0].get('instrument', {}).get('symbol', '?')
+        if order_status == 'REJECTED':
+            logger.error(f"ORDER REJECTED by Schwab — {symbol} order {order_id}: {status_description}")
+            raise OrderRejectedError(response.status_code, status_description or 'REJECTED', trade_obj.order)
+
+        logger.info(f"Order {order_id} for {symbol} accepted — Schwab status: {order_status or 'unknown'}")
+
         order_dict = {
             'order_id': order_id,
+            'order_status': order_status,
             'request_body': trade_obj.order
         }
 
@@ -1185,8 +1222,14 @@ class PyRobot():
 
                 account_info = positions_response[account_type_key]
 
+                # get_account() also returns e.g. 'aggregatedBalance' — only
+                # the 'securitiesAccount' entry carries positions.
+                if not isinstance(account_info, dict) or 'accountNumber' not in account_info:
+                    continue
+
                 account_id = account_info['accountNumber']
-                positions = account_info['positions']
+                # Schwab omits the key entirely when the account holds nothing.
+                positions = account_info.get('positions', [])
 
                 for position in positions:
                     position_dict = {}
