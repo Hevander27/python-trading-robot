@@ -1,121 +1,183 @@
 # Python Trading Robot
 
+A trading robot written in Python that runs automated strategies using technical
+analysis, connected to the **Charles Schwab Trader API** via
+[`schwab-py`](https://schwab-py.readthedocs.io/).
+
+This fork of [areed1192/python-trading-robot](https://github.com/areed1192/python-trading-robot)
+adds a full migration from the retired TD Ameritrade API to Schwab, a dynamic
+momentum strategy with a market-regime filter, and a set of live-trading
+safeguards developed after real-world testing.
+
 ## Table of Contents
 
 - [Overview](#overview)
+- [What This Fork Adds](#what-this-fork-adds)
 - [Setup](#setup)
+- [Configuration](#configuration)
 - [Usage](#usage)
+- [Live Trading Safeguards](#live-trading-safeguards)
+- [Tests](#tests)
 - [Support These Projects](#support-these-projects)
 
 ## Overview
 
-Current Version: **0.1.1**
+The core library mimics a few common scenarios:
 
-A trading robot written in Python that can run automated strategies using a technical analysis.
-The robot is designed to mimic a few common scenarios:
+1. **Portfolio** — maintain a portfolio of multiple instruments, calculate common
+   risk metrics, and get real-time feedback as you trade.
 
-1. Maintaining a portfolio of multiple instruments. The `Portfolio` object will be able
-   to calculate common risk metrics related to a portfolio and give real-time feedback
-   as you trade.
+2. **Trade** — define simple or complex orders in Python, including brackets like
+   a take profit and stop loss attached to the entry order.
 
-2. Define an order that can be used to trade a financial instrument. With the `Trade` object,
-   you can define simple or even complex orders using Python. These orders will also help similify
-   common scenarios like defining both a take profit and stop loss at the same time.
+3. **StockFrame** — a real-time data table holding both historical and streaming
+   prices, indexed for easy selection and further analysis.
 
-3. A real-time data table that includes both historical and real-time prices as they change. The
-   `StockFrame` will make the process of storing your data easy and quick. Additionally, it will be
-   setup so that way you can easily select your financial data as it comes in and do further analysis
-   if needed.
+4. **Indicators** — define indicator inputs (RSI, SMA, EMA, ...), calculate them,
+   and have their values refresh as new prices arrive.
 
-4. Define and calculate indicators using both historical and real-time prices. The `Indicator` object
-   will help you easily define the input of your indicators, calculate them, and then update their values
-   as new prices come.
+## What This Fork Adds
+
+**Schwab API migration** (TD Ameritrade shut down its API after the Schwab
+acquisition):
+
+- Authentication through `schwab.easy_client()` with browser-assisted OAuth and
+  token refresh (`token.json`).
+- Account-hash resolution, httpx-style responses, Schwab quote/price-history
+  payload shapes, and order placement via the Trader API.
+
+**Dynamic momentum strategy** (`samples/dynamic_strategy.py`) — an automated,
+self-resuming strategy built from new components in `pyrobot/`:
+
+| Component | File | Role |
+|---|---|---|
+| Scanner | `pyrobot/scanner.py` | Filters a ~7,000-symbol NASDAQ/NYSE universe by price (budget / max_positions), average volume, and same-day momentum |
+| Scorer | `pyrobot/scorer.py` | Composite score: 12-month momentum + EMA trend + RSI, weights configurable |
+| Position sizer | `pyrobot/position_sizer.py` | Equal-weight or score-weighted allocation, whole shares only |
+| Rebalancer | `pyrobot/rebalancer.py` | Periodically swaps the weakest holding for a meaningfully better candidate |
+| Regime filter | `pyrobot/regime_filter.py` | SPY vs. its 200-day EMA; bear market pauses new entries and tightens stops |
+| Backtester | `pyrobot/backtester.py` + `samples/backtest.py` | Test the strategy on historical data |
+| Universe builder | `scripts/build_universe.py` | Merges NASDAQ/NYSE screener CSVs, S&P 500, and Russell 1000 into `data/universe.csv` with sector metadata |
+
+The strategy persists its positions to `data/portfolio_state.json` after every
+trade so a restart resumes exactly where it left off, monitors intraday RSI for
+exits, applies a software stop loss, and enforces a per-sector position cap.
 
 ## Setup
 
-**Setup - Local Install:**
+Requires **Python 3.10+** (a `schwab-py` requirement).
 
-If you are planning to make modifications to this project or you would like to access it
-before it has been indexed on `PyPi`. I would recommend you either install this project
-in `editable` mode or do a `local install`. For those of you, who want to make modifications
-to this project. I would recommend you install the library in `editable` mode.
-
-If you want to install the library in `editable` mode, make sure to run the `setup.py`
-file, so you can install any dependencies you may need. To run the `setup.py` file,
-run the following command in your terminal.
+If you are planning to make modifications to this project, install it in
+`editable` mode:
 
 ```console
 pip install -e .
 ```
 
-If you don't plan to make any modifications to the project but still want to use it across
-your different projects, then do a local install.
+If you don't plan to make modifications but want to use it across projects, do a
+local install:
 
 ```console
 pip install .
 ```
 
-This will install all the dependencies listed in the `setup.py` file. Once done
-you can use the library wherever you want.
+## Configuration
 
-**Setup - PyPi Install:**
+Copy the example config and fill in your Schwab developer credentials:
 
-The project can be found at PyPI, if you'd like to view the project please use this
-[link](https://pypi.org/project/python-trading-robot/). To **install** the library,
-run the following command from the terminal.
-
-```bash
-pip install python-trading-robot
+```console
+cp config/config.example.ini config/config.ini
 ```
 
-**Setup - PyPi Upgrade:**
-
-To **upgrade** the library, run the following command from the terminal.
-
-```bash
-pip install --upgrade python-trading-robot
+```ini
+[main]
+api_key = YOUR_SCHWAB_APP_KEY
+app_secret = YOUR_SCHWAB_APP_SECRET
+callback_url = https://127.0.0.1:8182
+token_path = token.json
+account_number = YOUR_ACCOUNT_NUMBER
 ```
+
+You get the key and secret by registering an app on the
+[Schwab Developer Portal](https://developer.schwab.com/). The callback URL must
+use `127.0.0.1` (not `localhost`) and match the app registration exactly.
+
+The `[strategy]`, `[universe]`, `[regime]`, and `[sector]` sections control the
+dynamic strategy: total `budget`, `max_positions`, `min_volume`, stop-loss
+percentages, scoring weights, allocation mode, rebalance cadence, and the
+per-sector cap. See `config/config.example.ini` for the full annotated list.
+
+`config/config.ini`, `token.json`, and runtime state files are gitignored —
+never commit credentials.
 
 ## Usage
 
-To run the robot, you will need to provide a few pieces of information from your TD Ameritrade Developer account.
-The following items are need for authentication:
+Run the dynamic momentum strategy (scan → score → buy → monitor → rebalance):
 
-- Client ID: Also, called your consumer key, this was provided when you registered an app with the TD Ameritrade
-  Developer platform. An example of a client ID could look like the following `MMMMYYYYYA6444VXXXXBBJC3DOOOO`.
+```console
+cd python-trading-robot
+python -u samples/dynamic_strategy.py
+```
 
-- Redirect URI: Also called the callbakc URL or redirect URL, this was specified by you when you regiestered your app with
-  the TD Ameritrade Developer platform. Here is an example of a redirect URI <https://localhost/mycallback>
+On first run (and whenever the 7-day Schwab refresh token expires) a browser
+window opens for Schwab login; the token is then saved to `token.json`.
+Progress is logged to the console and `logs/trading.log`.
 
-- Credentials Path: This is a file path that will point to a JSON file where your state info will be saved. Keep in mind
-  that it is okay if it points to a non-existing file as once you run the script the file will be auto generated. For example,
-  if I want my state info to be saved to my desktop, then it would look like the following: `C:\Users\Desktop\ts_state.json`
+The bot starts in **paper mode** (`paper_trading=True` in
+`samples/dynamic_strategy.py`): orders are simulated, nothing is sent to
+Schwab. Set `paper_trading=False` to trade live — and delete any stale
+`data/portfolio_state.json` first so the bot doesn't resume phantom positions.
 
-Once you've identfied those pieces of info, you can run the robot. Here is a simple example that will create a new instance
-of it:
+Using the core library directly:
 
 ```python
 from pyrobot.robot import PyRobot
 
-# Initialize the robot
 trading_robot = PyRobot(
-    client_id='XXXXXX111111YYYY22',
-    redirect_uri='https://localhost/mycallback',
-    credentials_path='path/to/td_state.json'
+    api_key='YOUR_SCHWAB_APP_KEY',
+    app_secret='YOUR_SCHWAB_APP_SECRET',
+    callback_url='https://127.0.0.1:8182',
+    token_path='token.json',
+    trading_account='YOUR_ACCOUNT_NUMBER',
+    paper_trading=True
 )
 ```
 
-For more detailed examples, go to the `trading_robot.py` file to see an example of how to use the library along with all
-the different objects inside.
+For more detailed examples, see `samples/trading_robot.py`.
 
-## Support these Projects
+## Live Trading Safeguards
+
+Added after live testing surfaced real failure modes (a stale state file once
+caused ~1,100 duplicate order submissions — all rejected, but only by luck):
+
+- **Price precision** — every price is rounded to what Schwab accepts (2
+  decimals ≥ $1, 4 decimals < $1), including bracketed child stop orders.
+- **Rejection handling** — `execute_orders` checks both the HTTP response and
+  Schwab's actual order status; a rejected order raises `OrderRejectedError`
+  and is never recorded as a position.
+- **Idempotent signals** — each buy/sell signal fires at most once per symbol;
+  a signal that stays true across bars cannot resubmit the same order.
+- **Broker reconciliation** — on resume, the saved state is compared against
+  the real Schwab account; in live mode a mismatch refuses to start.
+- **Loop pacing** — the bar-wait logic can no longer spin in a tight loop when
+  the last bar is stale; one iteration per minute bar, always.
+
+## Tests
+
+Offline safety tests (no network, no credentials needed):
+
+```console
+python -m unittest tests.test_order_safety -v
+```
+
+## Support These Projects
+
+This fork builds on the original project by [Alex Reed](https://github.com/areed1192).
 
 **Patreon:**
-Help support this project and future projects by donating to my [Patreon Page](https://www.patreon.com/sigmacoding). I'm always
-looking to add more content for individuals like yourself, unfortuantely some of the APIs I would require me to pay monthly fees.
+Help support the original project and future projects by donating to his
+[Patreon Page](https://www.patreon.com/sigmacoding).
 
 **YouTube:**
-If you'd like to watch more of my content, feel free to visit my YouTube channel [Sigma Coding](https://www.youtube.com/c/SigmaCoding).
-
-<!-- **Hire Me:**
-If you have a project, you think I can help you with feel free to reach out at [coding.sigma@gmail.com](mailto:coding.sigma@gmail.com?subject=[GitHub]%20Project%20Proposal) or fill out the [contract request form](https://forms.office.com/Pages/ResponsePage.aspx?id=ZwOBErInsUGliXx0Yo2VfcCSWZSwW25Es3vPV2veU0pUMUs5MUc2STkzSzVQMFNDVlI5NjJVNjREUi4u) -->
+If you'd like to watch more of his content, feel free to visit his YouTube
+channel [Sigma Coding](https://www.youtube.com/c/SigmaCoding).
